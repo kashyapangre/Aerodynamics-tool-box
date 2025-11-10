@@ -1,7 +1,7 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import root_scalar
+from scipy.optimize import root_scalar, minimize_scalar
 
 # %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 # SECTION 1: CORE AERODYNAMIC & THERMODYNAMIC FUNCTIONS
@@ -85,6 +85,93 @@ def solve_ma_from_fanno_length(fL_D_val, k, flow_regime):
         return sol.root
     except (ValueError, RuntimeError): return np.nan
 
+# --- NEW FUNCTIONS FOR WEEK 5/6 ---
+
+def get_theta_from_beta(beta_deg, Ma1, k):
+    """Calculates deflection angle theta from beta and Ma1 using TBM relation."""
+    if Ma1 <= 1.0: return 0
+    beta_rad = np.radians(beta_deg)
+    Ma1_sq = Ma1**2
+    sin_beta_sq = np.sin(beta_rad)**2
+    cot_beta = 1 / np.tan(beta_rad)
+    cos_2beta = np.cos(2 * beta_rad)
+    
+    numerator = Ma1_sq * sin_beta_sq - 1
+    denominator = Ma1_sq * (k + cos_2beta) + 2
+    
+    if denominator == 0: return 0
+    tan_theta = 2 * cot_beta * (numerator / denominator)
+    return np.degrees(np.arctan(tan_theta))
+
+def get_oblique_shock_properties(Ma1, beta_deg, k):
+    """Calculates all properties for an oblique shock given Ma1 and beta."""
+    if Ma1 <= 1.0: return None
+    
+    beta_rad = np.radians(beta_deg)
+    Ma1_n = Ma1 * np.sin(beta_rad)
+    
+    if Ma1_n <= 1.0: # Not a shock (Mach wave or invalid)
+        return None 
+        
+    norm_shock_res = calculate_normal_shock_relations(Ma1_n, k)
+    theta_deg = get_theta_from_beta(beta_deg, Ma1, k)
+    theta_rad = np.radians(theta_deg)
+    
+    Ma2_n = norm_shock_res['M2']
+    Ma2 = Ma2_n / np.sin(beta_rad - theta_rad)
+    
+    results = {
+        'Ma1': Ma1, 'β (deg)': beta_deg, 'θ (deg)': theta_deg,
+        'Ma1_n': Ma1_n, 'Ma2_n': Ma2_n, 'Ma2': Ma2,
+        'p2/p1': norm_shock_res['p2/p1'],
+        'T2/T1': norm_shock_res['T2/T1'],
+        'rho2/rho1': norm_shock_res['rho2/rho1'],
+        'p02/p01': norm_shock_res['p02/p01']
+    }
+    return results
+
+def get_max_theta(Ma1, k):
+    """Finds the maximum deflection angle (theta_max) for a given Ma1."""
+    if Ma1 <= 1.0: return (0, 90)
+    mu_rad = np.arcsin(1 / Ma1)
+    mu_deg = np.degrees(mu_rad)
+    
+    # Find the beta that gives the maximum theta
+    opt_result = minimize_scalar(
+        lambda b: -get_theta_from_beta(b, Ma1, k), 
+        bounds=(mu_deg, 90), 
+        method='bounded'
+    )
+    
+    if opt_result.success:
+        theta_max = -opt_result.fun
+        beta_at_max = opt_result.x
+        return (theta_max, beta_at_max)
+    else:
+        return (0, 90) # Failed
+
+def solve_beta(Ma1, theta, k):
+    """Finds weak and strong beta solutions for a given Ma1 and theta."""
+    mu_deg = np.degrees(np.arcsin(1/Ma1))
+    theta_max, beta_at_max = get_max_theta(Ma1, k)
+    
+    if theta > theta_max:
+        return (np.nan, np.nan, theta_max) # Detached shock
+    
+    eqn = lambda b: get_theta_from_beta(b, Ma1, k) - theta
+    
+    try:
+        beta_weak = root_scalar(eqn, bracket=[mu_deg + 0.01, beta_at_max - 0.01]).root
+    except ValueError:
+        beta_weak = np.nan
+        
+    try:
+        beta_strong = root_scalar(eqn, bracket=[beta_at_max + 0.01, 89.99]).root
+    except ValueError:
+        beta_strong = np.nan
+        
+    return (beta_weak, beta_strong, theta_max)
+
 # %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 # SECTION 2: STREAMLIT USER INTERFACE
 # %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -118,12 +205,14 @@ with st.expander("**Unit Converters**", expanded=True):
             st.metric("Result", f"{pres_val * PA_TO_ATM:.6f} atm")
 
 # Create tabs for different functionalities
-tab_basic, tab_week1, tab_week2, tab_week3, tab_week4 = st.tabs([
+tab_basic, tab_week1, tab_week2, tab_week3, tab_week4, tab_week5, tab_week6 = st.tabs([
     "Basic Calculators",
     "Week 1: Aeroplane Drag",
     "Week 2: Isentropic Nozzle Flow",
     "Week 3: Fanno Flow & Wind Tunnels",
-    "Week 4: Shocks & Measurements"
+    "Week 4: Shocks & Measurements",
+    "Week 5: Oblique Shocks",
+    "Week 6: θ-β-Ma & Reflections"
 ])
 
 # --- BASIC CALCULATORS TAB ---
@@ -216,8 +305,8 @@ with tab_basic:
         col1, col2 = st.columns(2)
         with col1:
             st.latex("""
-            T^* = T_0 \\left(\\frac{2}{k+1}\\right) \\quad | \\quad 
-            p^* = p_0 \\left(\\frac{2}{k+1}\\right)^{\\frac{k}{k-1}} \\quad | \\quad
+            T^* = T_0 \\left(\\frac{2}{k+1}\\right) \quad | \quad 
+            p^* = p_0 \\left(\\frac{2}{k+1}\\right)^{\\frac{k}{k-1}} \quad | \quad
             \\rho^* = \\rho_0 \\left(\\frac{2}{k+1}\\right)^{\\frac{1}{k-1}}
             """)
             k_crit = st.number_input("k", value=1.4, format="%.3f", key="k_crit")
@@ -592,3 +681,245 @@ with tab_week4:
             if Ma is not None and not np.isnan(Ma): st.metric(label="Calculated Mach Number (Ma)", value=f"{Ma:.4f}")
             else: st.error("Failed to calculate Mach number.")
 
+# --- WEEK 5: OBLIQUE SHOCKS TAB ---
+with tab_week5:
+    st.header("Oblique Shocks & Expansion Waves (Session 5)")
+    st.markdown("Calculators based on Session 5a (Intro), 5b (Relations), and 5c (Examples).")
+
+    # --- Mach Angle Calculator ---
+    with st.expander("**Mach Angle (Session 5a & 5c)**: `μ = asin(1 / Ma)`"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.latex(r"\mu = \arcsin\left(\frac{1}{Ma}\right)")
+            solve_for_mach_angle = st.radio("Solve for:", ('Mach Angle (μ)', 'Mach Number (Ma)'), key="mach_angle_solve")
+            Ma_in_angle = st.number_input("Mach Number (Ma)", value=2.0, min_value=1.0001, format="%.4f", key="Ma_in_angle", disabled=(solve_for_mach_angle=='Mach Number (Ma)'))
+            mu_in_angle = st.number_input("Mach Angle (μ) in degrees", value=30.0, min_value=0.0, max_value=90.0, format="%.2f", key="mu_in_angle", disabled=(solve_for_mach_angle=='Mach Angle (μ)'))
+        with col2:
+            st.subheader("Result")
+            try:
+                if solve_for_mach_angle == 'Mach Angle (μ)':
+                    if Ma_in_angle <= 1.0: st.error("Mach number must be > 1 for a Mach wave.")
+                    else: 
+                        mu_rad = np.arcsin(1 / Ma_in_angle)
+                        mu_deg = np.degrees(mu_rad)
+                        st.metric("Mach Angle (μ)", f"{mu_deg:.2f}°")
+                else: # Solve for Ma
+                    if mu_in_angle <= 0 or mu_in_angle >= 90: st.error("Angle must be > 0° and < 90°.")
+                    else: 
+                        mu_rad = np.radians(mu_in_angle)
+                        Ma_out = 1 / np.sin(mu_rad)
+                        st.metric("Mach Number (Ma)", f"{Ma_out:.4f}")
+            except Exception as e: st.error(f"Calculation failed: {e}")
+
+    # --- Theta-Beta-Mach Relation ---
+    with st.expander("**Theta-Beta-Mach Relation (Session 5b)**"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.latex(r"\tan \theta = 2 \cot \beta \frac{Ma_1^2 \sin^2 \beta - 1}{Ma_1^2 (k + \cos 2\beta) + 2}")
+            st.markdown("Calculates deflection angle (θ) from $Ma_1$ and shock angle (β).")
+            k_tbm = st.number_input("k", value=1.4, format="%.3f", key="k_tbm")
+            Ma1_tbm = st.number_input("Upstream Mach (Ma1)", value=2.4, min_value=1.0001, format="%.4f", key="Ma1_tbm")
+            beta_tbm = st.number_input("Shock Angle (β) in degrees", value=30.0, min_value=0.0, max_value=90.0, format="%.2f", key="beta_tbm")
+        with col2:
+            st.subheader("Result")
+            try:
+                mu_rad = np.arcsin(1 / Ma1_tbm); mu_deg = np.degrees(mu_rad)
+                if beta_tbm <= mu_deg: 
+                    st.error(f"Shock angle (β) must be > Mach angle (μ = {mu_deg:.2f}°).")
+                elif Ma1_tbm <= 1.0:
+                    st.error("Upstream Mach Number (Ma1) must be > 1.")
+                else:
+                    theta_deg = get_theta_from_beta(beta_tbm, Ma1_tbm, k_tbm)
+                    st.metric("Deflection Angle (θ)", f"{theta_deg:.2f}°")
+                    st.info(f"For $Ma_1={Ma1_tbm}$, the minimum shock angle (Mach Angle μ) is {mu_deg:.2f}°. A normal shock is β=90°.")
+            except Exception as e: st.error(f"Calculation failed: {e}")
+
+    # --- Full Oblique Shock Solver ---
+    with st.expander("**Oblique Shock Relations Solver (Session 5b & 5c)**"):
+        st.markdown("This tool calculates all downstream properties from the upstream Mach number ($Ma_1$) and the shock wave angle (β), following the method in Session 5c, Examples 2 & 3.")
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.subheader("Inputs")
+            k_ob = st.number_input("k", value=1.4, format="%.3f", key="k_ob")
+            Ma1_ob = st.number_input("Upstream Mach (Ma1)", value=2.0, min_value=1.0001, format="%.4f", key="Ma1_ob")
+            beta_ob = st.number_input("Shock Angle (β) in degrees", value=53.4, format="%.2f", key="beta_ob")
+            
+            st.markdown("---")
+            st.subheader("Upstream Absolute Values (Optional)")
+            p1_ob = st.number_input("Upstream Static Pressure (p1), Pa", value=101325.0, format="%.1f", key="p1_ob")
+            T1_ob = st.number_input("Upstream Static Temperature (T1), K", value=288.0, format="%.2f", key="T1_ob")
+
+            if st.button("Calculate Oblique Shock Relations", key="calc_ob_w5"):
+                try:
+                    results = get_oblique_shock_properties(Ma1_ob, beta_ob, k_ob)
+                    if results is None:
+                        mu_deg = np.degrees(np.arcsin(1/Ma1_ob))
+                        st.error(f"Calculation failed. Check inputs. Is Ma1 > 1? Is β > Mach Angle (μ = {mu_deg:.2f}°)?")
+                        st.session_state.oblique_results_w5 = None
+                    else:
+                        st.session_state.oblique_results_w5 = results
+                        
+                        # Calculate absolute values
+                        p2_abs = p1_ob * results['p2/p1']
+                        T2_abs = T1_ob * results['T2/T1']
+                        
+                        isen_res_1 = calculate_isentropic_ratios(Ma1_ob, k_ob)
+                        p01_abs = p1_ob * isen_res_1['p0/p']
+                        T01_abs = T1_ob * isen_res_1['T0/T']
+                        
+                        p02_abs = p01_abs * results['p02/p01']
+                        T02_abs = T01_abs # T0 is constant
+                        
+                        st.session_state.oblique_abs_results_w5 = {
+                            'p1': p1_ob, 'T1': T1_ob, 'p2': p2_abs, 'T2': T2_abs,
+                            'p01': p01_abs, 'T01': T01_abs, 'p02': p02_abs, 'T02': T02_abs,
+                            'loss': p01_abs - p02_abs
+                        }
+                except Exception as e:
+                    st.error(f"Calculation Failed. Check inputs. Error: {e}")
+                    st.session_state.oblique_results_w5 = None
+
+        with col2:
+            st.subheader("Results - Ratios")
+            if 'oblique_results_w5' in st.session_state and st.session_state.oblique_results_w5:
+                res = st.session_state.oblique_results_w5
+                st.dataframe(
+                    { "Parameter": res.keys(), "Value": [f"{v:.4f}" for v in res.values()] },
+                    hide_index=True, use_container_width=True
+                )
+                
+                st.subheader("Results - Absolute Values")
+                abs_res = st.session_state.oblique_abs_results_w5
+                c1_abs, c2_abs = st.columns(2)
+                c1_abs.metric("Downstream Static Pressure (p2)", f"{abs_res['p2']:.1f} Pa | {abs_res['p2'] * PA_TO_ATM:.4f} atm")
+                c2_abs.metric("Downstream Static Temp (T2)", f"{abs_res['T2']:.2f} K | {abs_res['T2'] + K_TO_C:.2f} °C")
+                
+                c3_abs, c4_abs = st.columns(2)
+                c3_abs.metric("Upstream Total Pressure (p01)", f"{abs_res['p01']:.1f} Pa | {abs_res['p01'] * PA_TO_ATM:.4f} atm")
+                c4_abs.metric("Downstream Total Pressure (p02)", f"{abs_res['p02']:.1f} Pa | {abs_res['p02'] * PA_TO_ATM:.4f} atm")
+                
+                st.metric("Total Pressure Loss (p01 - p02)", f"{abs_res['loss']:.1f} Pa", delta=f"{-abs_res['loss']:.1f} Pa", delta_color="inverse")
+                st.metric("Total Temperature (T01 = T02)", f"{abs_res['T01']:.2f} K | {abs_res['T01'] + K_TO_C:.2f} °C")
+
+            else:
+                st.info("Enter upstream conditions and click calculate.")
+
+# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+# SECTION 3: NEW WEEK 6 TAB
+# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+with tab_week6:
+    st.header("θ-β-Ma Diagram & Shock Reflections (Session 6)")
+    st.markdown("Calculators based on Session 6a (TBM Diagram), 6b (Reflections), and 6d (Examples).")
+
+    # --- Detached Shock Advisor ---
+    with st.expander("**Detached Shock Advisor (Session 6a)**"):
+        st.markdown("Calculates the maximum deflection angle ($\theta_{max}$) for a given $Ma_1$. If your wedge angle is greater than this, a detached shock will form.")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.latex(r"\theta > \theta_{max} \implies \text{Detached Shock}")
+            k_det = st.number_input("k", value=1.4, format="%.3f", key="k_det")
+            Ma1_det = st.number_input("Upstream Mach (Ma1)", value=2.0, min_value=1.0001, format="%.4f", key="Ma1_det")
+            theta_det = st.number_input("Your Deflection Angle (θ) in degrees", value=20.0, format="%.2f", key="theta_det")
+        with col2:
+            st.subheader("Result")
+            if Ma1_det <= 1.0:
+                st.error("Ma1 must be > 1.0")
+            else:
+                theta_max, beta_at_max = get_max_theta(Ma1_det, k_det)
+                st.metric("Max Deflection Angle (θ_max)", f"{theta_max:.2f}°")
+                st.metric("Shock Angle at θ_max (β)", f"{beta_at_max:.2f}°")
+                
+                if theta_det > theta_max:
+                    st.error(f"Detached Shock: Your angle ({theta_det}°) > θ_max ({theta_max:.2f}°)")
+                else:
+                    st.success(f"Attached Shock Possible: Your angle ({theta_det}°) ≤ θ_max ({theta_max:.2f}°)")
+
+    # --- Weak vs. Strong Solution Finder ---
+    with st.expander("**Weak vs. Strong Solution Finder (Session 6a & 6d)**"):
+        st.markdown("Finds the two possible shock angles (weak and strong) for a given $Ma_1$ and $\theta$, as shown in the $\theta-\beta-Ma$ diagram.")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.latex(r"\text{Find } \beta \text{ from } Ma_1 \text{ and } \theta")
+            k_sol = st.number_input("k", value=1.4, format="%.3f", key="k_sol")
+            Ma1_sol = st.number_input("Upstream Mach (Ma1)", value=2.0, min_value=1.0001, format="%.4f", key="Ma1_sol")
+            theta_sol = st.number_input("Deflection Angle (θ) in degrees", value=10.0, format="%.2f", key="theta_sol")
+        with col2:
+            st.subheader("Results")
+            if Ma1_sol <= 1.0:
+                st.error("Ma1 must be > 1.0")
+            else:
+                beta_weak, beta_strong, theta_max = solve_beta(Ma1_sol, theta_sol, k_sol)
+                st.metric("Max Deflection (θ_max)", f"{theta_max:.2f}°")
+                if np.isnan(beta_weak):
+                    st.error(f"Detached Shock: Your angle ({theta_sol}°) > θ_max ({theta_max:.2f}°)")
+                else:
+                    st.metric("Weak Solution (β_weak)", f"{beta_weak:.2f}°")
+                    st.metric("Strong Solution (β_strong)", f"{beta_strong:.2f}°")
+
+    # --- Shock Reflection Solver ---
+    with st.expander("**Shock Reflection Solver (Session 6b & 6d)**"):
+        st.markdown("Solves the full shock reflection problem from a concave corner and a flat wall, as shown in Session 6d, Example 2.")
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.subheader("Inputs")
+            k_ref = st.number_input("k", value=1.4, format="%.3f", key="k_ref")
+            st.markdown("---")
+            st.subheader("Region 1 (Freestream)")
+            Ma1_ref = st.number_input("Ma1", value=3.6, min_value=1.0001, format="%.4f", key="Ma1_ref")
+            theta_ref = st.number_input("Deflection Angle (θ) in degrees", value=10.0, format="%.2f", key="theta_ref")
+            p1_ref = st.number_input("p1 (Pa)", value=101000.0, format="%.1f", key="p1_ref")
+            T1_ref = st.number_input("T1 (K)", value=288.0, format="%.2f", key="T1_ref")
+            
+            if st.button("Calculate Shock Reflection", key="calc_ref_w6"):
+                st.session_state.ref_results = {}
+                # --- Step 1: Incident Shock ---
+                beta_1, _, theta_max_1 = solve_beta(Ma1_ref, theta_ref, k_ref)
+                if np.isnan(beta_1):
+                    st.error(f"Incident shock is detached: θ ({theta_ref}°) > θ_max ({theta_max_1:.2f}°)")
+                    st.session_state.ref_results = None
+                else:
+                    props_1 = get_oblique_shock_properties(Ma1_ref, beta_1, k_ref)
+                    Ma2 = props_1['Ma2']
+                    p2 = p1_ref * props_1['p2/p1']
+                    T2 = T1_ref * props_1['T2/T1']
+                    st.session_state.ref_results['region2'] = {'Ma2': Ma2, 'p2': p2, 'T2': T2, 'beta1': beta_1}
+                    
+                    # --- Step 2: Reflected Shock ---
+                    # Upstream conditions are now Ma2 and theta_ref
+                    beta_2, _, theta_max_2 = solve_beta(Ma2, theta_ref, k_ref)
+                    if np.isnan(beta_2):
+                        st.error(f"Reflected shock is detached: θ ({theta_ref}°) > θ_max for Ma2 ({theta_max_2:.2f}°)")
+                        st.session_state.ref_results['region3'] = None
+                    else:
+                        props_2 = get_oblique_shock_properties(Ma2, beta_2, k_ref)
+                        Ma3 = props_2['Ma2']
+                        p3 = p2 * props_2['p2/p1']
+                        T3 = T2 * props_2['T2/T1']
+                        phi = beta_2 - theta_ref # Reflected angle to wall
+                        st.session_state.ref_results['region3'] = {'Ma3': Ma3, 'p3': p3, 'T3': T3, 'beta2': beta_2, 'phi': phi}
+        
+        with col2:
+            st.subheader("Results")
+            if 'ref_results' in st.session_state and st.session_state.ref_results:
+                res2 = st.session_state.ref_results.get('region2')
+                if res2:
+                    st.subheader("Region 2 (After Incident Shock)")
+                    c1, c2 = st.columns(2)
+                    c1.metric("Incident Shock Angle (β1)", f"{res2['beta1']:.2f}°")
+                    c2.metric("Ma2", f"{res2['Ma2']:.4f}")
+                    c1.metric("p2", f"{res2['p2']:.1f} Pa | {res2['p2'] * PA_TO_ATM:.4f} atm")
+                    c2.metric("T2", f"{res2['T2']:.2f} K | {res2['T2'] + K_TO_C:.2f} °C")
+                
+                res3 = st.session_state.ref_results.get('region3')
+                if res3:
+                    st.markdown("---")
+                    st.subheader("Region 3 (After Reflected Shock)")
+                    c3, c4 = st.columns(2)
+                    c3.metric("Reflected Shock Angle (β2)", f"{res3['beta2']:.2f}°")
+                    c4.metric("Ma3", f"{res3['Ma3']:.4f}")
+                    c3.metric("p3", f"{res3['p3']:.1f} Pa | {res3['p3'] * PA_TO_ATM:.4f} atm")
+                    c4.metric("T3", f"{res3['T3']:.2f} K | {res3['T3'] + K_TO_C:.2f} °C")
+                    st.metric("Reflected Angle to Wall (Φ)", f"{res3['phi']:.2f}°")
+            else:
+                st.info("Enter freestream conditions and click calculate.")
